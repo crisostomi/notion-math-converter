@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Notion Math Converter v6.1
+// @name         Notion Math Converter v6.3
 // @namespace    http://tampermonkey.net/
-// @version      6.1
+// @version      6.3
 // @description  Finds multi-line [ ... ] and $$ ... $$ math blocks in Notion and converts them to equation blocks.
 // @author       You
 // @match        https://www.notion.so/*
@@ -13,333 +13,464 @@
 (function () {
     'use strict';
 
-    // --- CONFIG ---
-    const MENU_DELAY = 900;      // ms to wait for Notion's slash command menu
-    const ACTION_DELAY = 80;     // ms between small actions
-    const SETTLE_DELAY = 500;    // ms to let the DOM settle after a conversion
+    const MENU_DELAY = 900;
+    const ACTION_DELAY = 80;
+    const SETTLE_DELAY = 500;
 
-    // --- UI SETUP ---
-    const existing = document.getElementById('notion-math-tool-v6');
+    const existing = document.getElementById('notion-math-tool');
     if (existing) existing.remove();
 
     GM_addStyle(`
-        #notion-math-tool-v6 {
-            position: fixed; top: 60px; right: 20px; z-index: 99999;
-            background: #1e1e2e; color: #cdd6f4; border-radius: 8px;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.4); width: 170px;
-            font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 13px; text-align: center;
+        /* --- Collapsed FAB --- */
+        #nmt-fab {
+            position: fixed;
+            top: 56px;
+            right: 16px;
+            z-index: 99999;
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            border: none;
+            background: white;
+            box-shadow: rgba(15, 15, 15, 0.04) 0px 0px 0px 1px,
+                        rgba(15, 15, 15, 0.03) 0px 3px 6px,
+                        rgba(15, 15, 15, 0.06) 0px 9px 24px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: "Times New Roman", "Latin Modern Math", serif;
+            font-size: 20px;
+            font-weight: 400;
+            color: rgb(55, 53, 47);
+            transition: transform 0.15s ease, box-shadow 0.15s ease;
+            padding: 0;
+            line-height: 1;
+        }
+        #nmt-fab:hover {
+            transform: scale(1.08);
+            box-shadow: rgba(15, 15, 15, 0.06) 0px 0px 0px 1px,
+                        rgba(15, 15, 15, 0.06) 0px 5px 10px,
+                        rgba(15, 15, 15, 0.1) 0px 12px 30px;
+        }
+        #nmt-fab.hidden { display: none; }
+
+        /* --- Expanded panel --- */
+        #notion-math-tool {
+            position: fixed;
+            top: 56px;
+            right: 16px;
+            z-index: 99999;
+            width: 240px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: rgba(15, 15, 15, 0.04) 0px 0px 0px 1px,
+                        rgba(15, 15, 15, 0.03) 0px 3px 6px,
+                        rgba(15, 15, 15, 0.06) 0px 9px 24px;
+            font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont,
+                         "Segoe UI", Helvetica, Arial, sans-serif;
+            font-size: 14px;
+            color: rgb(55, 53, 47);
+            overflow: hidden;
+            transform-origin: top right;
+            animation: nmt-pop-in 0.15s ease;
+        }
+        #notion-math-tool.hidden {
+            display: none;
+        }
+
+        @keyframes nmt-pop-in {
+            from { opacity: 0; transform: scale(0.92); }
+            to   { opacity: 1; transform: scale(1); }
+        }
+
+        /* --- Header --- */
+        #nmt-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            border-bottom: 1px solid rgb(233, 233, 231);
             user-select: none;
         }
-        #nmt-header { padding: 8px 10px; font-weight: 600; border-bottom: 1px solid #45475a; font-size: 12px; }
+        #nmt-header-icon {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px; height: 22px;
+            border-radius: 4px;
+            background: rgb(245, 244, 241);
+            flex-shrink: 0;
+            font-family: "Times New Roman", "Latin Modern Math", serif;
+            font-size: 15px;
+            color: rgb(55, 53, 47);
+            line-height: 1;
+        }
+        #nmt-header-title {
+            font-size: 14px;
+            font-weight: 500;
+            line-height: 1.2;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .nmt-header-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px; height: 22px;
+            border-radius: 4px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            color: rgba(55, 53, 47, 0.35);
+            transition: background 0.1s, color 0.1s;
+            flex-shrink: 0;
+            padding: 0;
+        }
+        .nmt-header-btn:hover { background: rgb(239, 238, 235); color: rgb(55, 53, 47); }
+        .nmt-header-btn svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; }
+        #nmt-fold-btn { margin-left: auto; }
+
+        /* --- Buttons --- */
+        #nmt-actions { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; }
         .nmt-btn {
-            background: #cba6f7; color: #1e1e2e; border: none; padding: 10px;
-            width: 100%; cursor: pointer; font-weight: 700; font-size: 13px;
-            transition: background 0.15s;
+            display: flex; align-items: center; justify-content: center; gap: 6px;
+            width: 100%; padding: 6px 12px; border-radius: 6px; border: none;
+            font-family: inherit; font-size: 14px; font-weight: 500;
+            cursor: pointer; transition: background 0.1s; line-height: 1.5;
         }
-        .nmt-btn:hover { background: #b4befe; }
-        .nmt-btn:disabled { background: #585b70; color: #7f849c; cursor: default; }
-        #nmt-scan-btn {
-            background: #45475a; color: #cdd6f4; font-weight: 500; font-size: 11px; padding: 7px;
-            border: none; width: 100%; cursor: pointer;
+        .nmt-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+        #nmt-scan-btn { background: rgb(245, 244, 241); color: rgb(55, 53, 47); }
+        #nmt-scan-btn:hover { background: rgb(239, 238, 235); }
+        #nmt-convert-btn { background: rgb(35, 131, 226); color: white; }
+        #nmt-convert-btn:hover { background: rgb(0, 113, 210); }
+        .nmt-btn:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+
+        /* --- Status --- */
+        #nmt-status-wrap { padding: 0 12px 8px; }
+        #nmt-status {
+            display: flex; align-items: center; gap: 6px;
+            padding: 5px 10px; border-radius: 6px;
+            background: rgb(245, 244, 241);
+            font-size: 12px; color: rgba(55, 53, 47, 0.65);
+            line-height: 1.4; min-height: 18px; transition: background 0.15s;
         }
-        #nmt-scan-btn:hover { background: #585b70; }
-        #nmt-status { padding: 6px 8px; font-size: 10px; color: #a6adc8; min-height: 14px; }
-        #nmt-log { max-height: 150px; overflow-y: auto; text-align: left; padding: 0 8px 6px; font-size: 9px; color: #7f849c; }
-        #nmt-log div { padding: 1px 0; border-bottom: 1px solid #313244; }
+        #nmt-status.success { background: rgb(219, 237, 219); color: rgb(28, 56, 41); }
+        #nmt-status.working { background: rgb(227, 226, 224); color: rgb(55, 53, 47); }
+        #nmt-status.error   { background: rgb(253, 235, 236); color: rgb(93, 23, 21); }
+        #nmt-status-dot {
+            width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+            background: rgba(55, 53, 47, 0.25); transition: background 0.15s;
+        }
+        #nmt-status.success #nmt-status-dot { background: rgb(68, 131, 97); }
+        #nmt-status.working #nmt-status-dot { background: rgb(35, 131, 226); animation: nmt-pulse 1s ease-in-out infinite; }
+        #nmt-status.error #nmt-status-dot { background: rgb(212, 76, 71); }
+        @keyframes nmt-pulse { 0%,100% { opacity:1 } 50% { opacity:0.3 } }
+
+        /* --- Log --- */
+        #nmt-log-wrap {
+            border-top: 1px solid rgb(233, 233, 231);
+            max-height: 0; overflow: hidden; transition: max-height 0.2s ease;
+        }
+        #nmt-log-wrap.open { max-height: 200px; }
+        #nmt-log-toggle {
+            display: flex; align-items: center; gap: 4px;
+            width: 100%; padding: 6px 12px; border: none; background: transparent;
+            cursor: pointer; font-family: inherit; font-size: 12px;
+            color: rgba(55, 53, 47, 0.5); transition: color 0.1s;
+        }
+        #nmt-log-toggle:hover { color: rgb(55, 53, 47); }
+        #nmt-log-toggle svg {
+            width: 12px; height: 12px; stroke: currentColor; fill: none; stroke-width: 2;
+            transition: transform 0.2s ease;
+        }
+        #nmt-log-wrap.open #nmt-log-toggle svg { transform: rotate(90deg); }
+        #nmt-log {
+            max-height: 160px; overflow-y: auto; padding: 0 12px 8px;
+            scrollbar-width: thin; scrollbar-color: rgb(225,225,225) transparent;
+        }
+        #nmt-log::-webkit-scrollbar { width: 4px; }
+        #nmt-log::-webkit-scrollbar-thumb { background: rgb(225,225,225); border-radius: 4px; }
+        .nmt-log-entry {
+            padding: 3px 0; font-size: 11px; line-height: 1.5;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            color: rgba(55, 53, 47, 0.5); border-bottom: 1px solid rgb(241, 241, 239);
+        }
+        .nmt-log-entry:last-child { border-bottom: none; }
+        .nmt-log-entry.found { color: rgb(68, 131, 97); }
+        .nmt-log-entry.warn  { color: rgb(203, 145, 47); }
+
+        /* --- Dark mode --- */
+        .notion-dark-theme #nmt-fab, .dark #nmt-fab {
+            background: rgb(37, 37, 37); color: rgba(255,255,255,0.81);
+            box-shadow: rgba(15,15,15,0.1) 0px 0px 0px 1px, rgba(15,15,15,0.2) 0px 3px 6px, rgba(15,15,15,0.4) 0px 9px 24px;
+        }
+        .notion-dark-theme #notion-math-tool, .dark #notion-math-tool {
+            background: rgb(37,37,37); color: rgba(255,255,255,0.81);
+            box-shadow: rgba(15,15,15,0.1) 0px 0px 0px 1px, rgba(15,15,15,0.2) 0px 3px 6px, rgba(15,15,15,0.4) 0px 9px 24px;
+        }
+        .notion-dark-theme #nmt-header, .dark #nmt-header { border-color: rgb(63,63,63); }
+        .notion-dark-theme #nmt-header-title, .dark #nmt-header-title { color: rgba(255,255,255,0.81); }
+        .notion-dark-theme #nmt-header-icon, .dark #nmt-header-icon { background: rgb(55,55,55); color: rgba(255,255,255,0.81); }
+        .notion-dark-theme .nmt-header-btn, .dark .nmt-header-btn { color: rgba(255,255,255,0.3); }
+        .notion-dark-theme .nmt-header-btn:hover, .dark .nmt-header-btn:hover { background: rgb(55,55,55); color: rgba(255,255,255,0.81); }
+        .notion-dark-theme #nmt-scan-btn, .dark #nmt-scan-btn { background: rgb(55,55,55); color: rgba(255,255,255,0.81); }
+        .notion-dark-theme #nmt-scan-btn:hover, .dark #nmt-scan-btn:hover { background: rgb(63,63,63); }
+        .notion-dark-theme #nmt-status, .dark #nmt-status { background: rgb(55,55,55); color: rgba(255,255,255,0.5); }
+        .notion-dark-theme #nmt-status.success, .dark #nmt-status.success { background: rgb(36,61,48); color: rgb(127,195,145); }
+        .notion-dark-theme #nmt-status.working, .dark #nmt-status.working { background: rgb(45,55,72); color: rgb(129,176,223); }
+        .notion-dark-theme #nmt-status.error, .dark #nmt-status.error { background: rgb(66,34,34); color: rgb(223,132,129); }
+        .notion-dark-theme #nmt-log-wrap, .dark #nmt-log-wrap { border-color: rgb(63,63,63); }
+        .notion-dark-theme #nmt-log-toggle, .dark #nmt-log-toggle { color: rgba(255,255,255,0.3); }
+        .notion-dark-theme #nmt-log-toggle:hover, .dark #nmt-log-toggle:hover { color: rgba(255,255,255,0.7); }
+        .notion-dark-theme .nmt-log-entry, .dark .nmt-log-entry { color: rgba(255,255,255,0.35); border-color: rgb(55,55,55); }
+        .notion-dark-theme .nmt-log-entry.found, .dark .nmt-log-entry.found { color: rgb(127,195,145); }
+        .notion-dark-theme .nmt-log-entry.warn, .dark .nmt-log-entry.warn { color: rgb(218,178,100); }
+        .notion-dark-theme #nmt-log::-webkit-scrollbar-thumb, .dark #nmt-log::-webkit-scrollbar-thumb { background: rgb(63,63,63); }
     `);
 
-    const uiContainer = document.createElement('div');
-    uiContainer.id = 'notion-math-tool-v6';
-    uiContainer.innerHTML = `
-        <div id="nmt-header">Math Converter v6.1</div>
-        <button id="nmt-scan-btn">SCAN (dry run)</button>
-        <button id="nmt-convert-btn" class="nmt-btn">CONVERT</button>
-        <div id="nmt-status">Idle</div>
-        <div id="nmt-log"></div>
+    // --- FAB (collapsed state) ---
+    const fab = document.createElement('button');
+    fab.id = 'nmt-fab';
+    fab.textContent = 'Σ';
+    fab.title = 'Math Converter';
+    document.body.appendChild(fab);
+
+    // --- Panel (expanded state) ---
+    const panel = document.createElement('div');
+    panel.id = 'notion-math-tool';
+    panel.classList.add('hidden');
+    panel.innerHTML = `
+        <div id="nmt-header">
+            <div id="nmt-header-icon">Σ</div>
+            <span id="nmt-header-title">Math Converter</span>
+            <button id="nmt-fold-btn" class="nmt-header-btn" title="Minimize">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            </button>
+            <button id="nmt-close-btn" class="nmt-header-btn" title="Close">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+        </div>
+        <div id="nmt-actions">
+            <button id="nmt-scan-btn" class="nmt-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                </svg>
+                Scan page
+            </button>
+            <button id="nmt-convert-btn" class="nmt-btn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="20 6 9 17 4 12"/>
+                </svg>
+                Convert all
+            </button>
+        </div>
+        <div id="nmt-status-wrap">
+            <div id="nmt-status">
+                <div id="nmt-status-dot"></div>
+                <span id="nmt-status-text">Ready</span>
+            </div>
+        </div>
+        <div id="nmt-log-wrap">
+            <button id="nmt-log-toggle">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                Log
+            </button>
+            <div id="nmt-log"></div>
+        </div>
     `;
-    document.body.appendChild(uiContainer);
+    document.body.appendChild(panel);
 
-    const statusEl = document.getElementById('nmt-status');
-    const logEl = document.getElementById('nmt-log');
+    // --- State toggling ---
+    function expand() {
+        fab.classList.add('hidden');
+        panel.classList.remove('hidden');
+    }
+    function collapse() {
+        panel.classList.add('hidden');
+        fab.classList.remove('hidden');
+    }
+    function closeAll() {
+        panel.classList.add('hidden');
+        fab.classList.add('hidden');
+    }
+
+    fab.onclick = expand;
+    document.getElementById('nmt-fold-btn').onclick = collapse;
+    document.getElementById('nmt-close-btn').onclick = closeAll;
+    document.getElementById('nmt-log-toggle').onclick = () => {
+        document.getElementById('nmt-log-wrap').classList.toggle('open');
+    };
+
+    // --- Status & log helpers ---
+    const statusEl  = document.getElementById('nmt-status');
+    const statusTxt = document.getElementById('nmt-status-text');
+    const logEl     = document.getElementById('nmt-log');
+    const logWrap   = document.getElementById('nmt-log-wrap');
     const convertBtn = document.getElementById('nmt-convert-btn');
-    const scanBtn = document.getElementById('nmt-scan-btn');
+    const scanBtn    = document.getElementById('nmt-scan-btn');
 
-    function setStatus(msg) { statusEl.innerText = msg; }
-    function log(msg) {
+    function setStatus(msg, type = '') { statusTxt.innerText = msg; statusEl.className = type; }
+    function log(msg, type = '') {
         console.log('[NotionMath]', msg);
         const d = document.createElement('div');
+        d.className = 'nmt-log-entry' + (type ? ' ' + type : '');
         d.textContent = msg;
         logEl.prepend(d);
         while (logEl.children.length > 40) logEl.lastChild.remove();
+        if (!logWrap.classList.contains('open')) logWrap.classList.add('open');
     }
 
-    // --- HELPERS ---
-
+    // --- Core helpers ---
     const sleep = ms => new Promise(r => setTimeout(r, ms));
+    function clean(t) { return t.replace(/[\u200B-\u200D\u2060\uFEFF\u00A0]/g, '').trim(); }
 
-    /** Strip invisible Unicode junk that Notion injects */
-    function clean(text) {
-        return text.replace(/[\u200B-\u200D\u2060\uFEFF\u00A0]/g, '').trim();
+    function selectContentsOf(el) {
+        const s = window.getSelection(), r = document.createRange();
+        r.selectNodeContents(el); s.removeAllRanges(); s.addRange(r);
     }
 
-    /**
-     * CRITICAL FIX: Select only the contents of a specific element,
-     * NOT the whole page. document.execCommand('selectAll') selects
-     * the entire Notion page which destroys everything.
-     */
-    function selectContentsOf(element) {
-        const selection = window.getSelection();
-        const range = document.createRange();
-        range.selectNodeContents(element);
-        selection.removeAllRanges();
-        selection.addRange(range);
-    }
-
-    /** Get the closest Notion block wrapper for a contenteditable element */
-    function getNotionBlock(el) {
-        // Notion wraps each block in a div with data-block-id
-        return el.closest('[data-block-id]') || el;
-    }
-
-    /** Get ordered list of leaf contenteditable blocks inside the page */
     function getPageBlocks() {
         const page = document.querySelector('.notion-page-content')
             || document.querySelector('[class*="notion-page-content"]')
             || document.querySelector('.notion-scroller');
-        if (!page) {
-            log('⚠ Could not find page content container');
-            return [];
-        }
-
-        const all = Array.from(page.querySelectorAll('[contenteditable="true"]'));
-
-        return all.filter(el => {
+        if (!page) return [];
+        return Array.from(page.querySelectorAll('[contenteditable="true"]')).filter(el => {
             if (el.closest('.notion-code-block')) return false;
             if (el.closest('.notion-equation-block')) return false;
             if (el.closest('[class*="katex"]')) return false;
-            // Skip our own UI
-            if (el.closest('#notion-math-tool-v6')) return false;
-            // Only leaf editables
-            const nested = el.querySelector('[contenteditable="true"]');
-            if (nested) return false;
+            if (el.closest('#notion-math-tool')) return false;
+            if (el.querySelector('[contenteditable="true"]')) return false;
             return true;
         });
     }
 
-    /** Dispatch keyboard events properly */
     function pressKey(el, key, keyCode, extra = {}) {
-        const baseOpts = {
-            key, keyCode, code: key, which: keyCode,
-            bubbles: true, cancelable: true, ...extra
-        };
-        el.dispatchEvent(new KeyboardEvent('keydown', baseOpts));
-        el.dispatchEvent(new KeyboardEvent('keypress', baseOpts));
-        el.dispatchEvent(new KeyboardEvent('keyup', baseOpts));
+        const o = { key, keyCode, code: key, which: keyCode, bubbles: true, cancelable: true, ...extra };
+        el.dispatchEvent(new KeyboardEvent('keydown', o));
+        el.dispatchEvent(new KeyboardEvent('keypress', o));
+        el.dispatchEvent(new KeyboardEvent('keyup', o));
     }
 
-    // --- SCANNING ---
-
+    // --- Scanning ---
     function scanForMath() {
-        const blocks = getPageBlocks();
-        const groups = [];
-        const used = new Set();
-
+        const blocks = getPageBlocks(), groups = [], used = new Set();
         for (let i = 0; i < blocks.length; i++) {
             if (used.has(i)) continue;
             const text = clean(blocks[i].textContent);
 
-            // --- Multi-line [ ... ] ---
             if (text === '[') {
-                let mathLines = [];
-                let endIdx = -1;
+                let lines = [], end = -1;
                 for (let j = i + 1; j < blocks.length && j < i + 40; j++) {
                     const t = clean(blocks[j].textContent);
-                    if (t === ']') { endIdx = j; break; }
-                    mathLines.push(t);
+                    if (t === ']') { end = j; break; }
+                    lines.push(t);
                 }
-                if (endIdx !== -1 && mathLines.length > 0) {
-                    const math = mathLines.join(' ');
-                    groups.push({ type: 'bracket-multi', startIdx: i, endIdx, math, blockCount: endIdx - i + 1 });
-                    for (let k = i; k <= endIdx; k++) used.add(k);
+                if (end !== -1 && lines.length) {
+                    groups.push({ type: 'bracket-multi', startIdx: i, endIdx: end, math: lines.join(' '), blockCount: end - i + 1 });
+                    for (let k = i; k <= end; k++) used.add(k);
                     continue;
                 }
             }
-
-            // --- Single-line [ ... ] ---
             if (text.startsWith('[') && text.endsWith(']') && text.length > 4) {
                 const inner = text.slice(1, -1).trim();
-                if (/[\\{}^_=]/.test(inner) || /\\[a-zA-Z]/.test(inner)) {
+                if (/[\\{}^_=]/.test(inner)) {
                     groups.push({ type: 'bracket-single', startIdx: i, endIdx: i, math: inner, blockCount: 1 });
-                    used.add(i);
-                    continue;
+                    used.add(i); continue;
                 }
             }
-
-            // --- Multi-line $$ ... $$ ---
             if (text === '$$') {
-                let mathLines = [];
-                let endIdx = -1;
+                let lines = [], end = -1;
                 for (let j = i + 1; j < blocks.length && j < i + 40; j++) {
                     const t = clean(blocks[j].textContent);
-                    if (t === '$$') { endIdx = j; break; }
-                    mathLines.push(t);
+                    if (t === '$$') { end = j; break; }
+                    lines.push(t);
                 }
-                if (endIdx !== -1 && mathLines.length > 0) {
-                    const math = mathLines.join(' ');
-                    groups.push({ type: 'dollar-multi', startIdx: i, endIdx, math, blockCount: endIdx - i + 1 });
-                    for (let k = i; k <= endIdx; k++) used.add(k);
+                if (end !== -1 && lines.length) {
+                    groups.push({ type: 'dollar-multi', startIdx: i, endIdx: end, math: lines.join(' '), blockCount: end - i + 1 });
+                    for (let k = i; k <= end; k++) used.add(k);
                     continue;
                 }
             }
-
-            // --- Single-line $$ ... $$ ---
             if (text.startsWith('$$') && text.endsWith('$$') && text.length > 4) {
                 const inner = text.slice(2, -2).trim();
                 groups.push({ type: 'dollar-single', startIdx: i, endIdx: i, math: inner, blockCount: 1 });
-                used.add(i);
-                continue;
+                used.add(i); continue;
             }
         }
-
         return { blocks, groups };
     }
 
-    // --- CONVERSION ---
-
-    /** Safely clear a single block's text and delete the empty block via Backspace */
+    // --- Conversion ---
     async function deleteBlock(block) {
-        block.focus();
-        await sleep(ACTION_DELAY);
-
-        // Select ONLY this block's contents (not the whole page!)
-        selectContentsOf(block);
-        await sleep(ACTION_DELAY);
-
-        // Delete just the selected text within this block
-        document.execCommand('delete');
-        await sleep(ACTION_DELAY);
-
-        // Now the block is empty — Backspace removes it and merges with above
-        pressKey(document.activeElement, 'Backspace', 8);
-        await sleep(ACTION_DELAY + 150);
+        block.focus(); await sleep(ACTION_DELAY);
+        selectContentsOf(block); await sleep(ACTION_DELAY);
+        document.execCommand('delete'); await sleep(ACTION_DELAY);
+        pressKey(document.activeElement, 'Backspace', 8); await sleep(ACTION_DELAY + 150);
     }
 
-    /** Convert a single block into a Notion equation block */
-    async function typeAsMathBlock(block, mathContent) {
-        block.focus();
-        await sleep(ACTION_DELAY);
-
-        // Select ONLY this block's contents
-        selectContentsOf(block);
-        await sleep(ACTION_DELAY);
-
-        // Delete just the selected content
-        document.execCommand('delete');
-        await sleep(ACTION_DELAY);
-
-        // Type /math to trigger Notion's slash command
-        document.execCommand('insertText', false, '/math');
-        await sleep(MENU_DELAY);
-
-        // Press Enter to confirm "Block equation"
-        pressKey(document.activeElement, 'Enter', 13);
-        await sleep(500);
-
-        // Type the LaTeX
-        document.execCommand('insertText', false, mathContent);
-        await sleep(ACTION_DELAY);
-
-        // Press Escape to close the equation editor
-        pressKey(document.activeElement, 'Escape', 27);
-        await sleep(ACTION_DELAY);
+    async function typeAsMathBlock(block, math) {
+        block.focus(); await sleep(ACTION_DELAY);
+        selectContentsOf(block); await sleep(ACTION_DELAY);
+        document.execCommand('delete'); await sleep(ACTION_DELAY);
+        document.execCommand('insertText', false, '/math'); await sleep(MENU_DELAY);
+        pressKey(document.activeElement, 'Enter', 13); await sleep(500);
+        document.execCommand('insertText', false, math); await sleep(ACTION_DELAY);
+        pressKey(document.activeElement, 'Escape', 27); await sleep(ACTION_DELAY);
     }
 
-    /** Convert one math group. Returns true if it did something. */
     async function convertOneGroup() {
         const { blocks, groups } = scanForMath();
-        if (groups.length === 0) return false;
+        if (!groups.length) return false;
+        const g = groups[0];
+        log(`${g.type} · ${g.blockCount} block(s)`, 'found');
+        log(`  ${g.math.slice(0, 70)}${g.math.length > 70 ? '…' : ''}`);
 
-        const group = groups[0];
-        log(`Converting: ${group.type} (${group.blockCount} blocks)`);
-        log(`  Math: "${group.math.slice(0, 70)}${group.math.length > 70 ? '...' : ''}"`);
-
-        if (group.blockCount === 1) {
-            await typeAsMathBlock(blocks[group.startIdx], group.math);
+        if (g.blockCount === 1) {
+            await typeAsMathBlock(blocks[g.startIdx], g.math);
         } else {
-            // Multi-block: delete extra blocks bottom-up, then convert the first
-            for (let j = group.endIdx; j > group.startIdx; j--) {
-                log(`  Deleting block ${j}...`);
-                // Re-scan to get fresh block references (DOM shifts after each delete)
+            for (let j = g.endIdx; j > g.startIdx; j--) {
                 const fresh = getPageBlocks();
-                if (j < fresh.length) {
-                    await deleteBlock(fresh[j]);
-                } else {
-                    log(`  ⚠ Block ${j} no longer exists, skipping`);
-                }
+                if (j < fresh.length) await deleteBlock(fresh[j]);
                 await sleep(150);
             }
-
-            // Re-scan one more time to convert the remaining first block
-            const freshAfter = getPageBlocks();
-            if (group.startIdx < freshAfter.length) {
-                await typeAsMathBlock(freshAfter[group.startIdx], group.math);
-            } else {
-                log('  ⚠ Start block disappeared');
-            }
+            const fresh = getPageBlocks();
+            if (g.startIdx < fresh.length) await typeAsMathBlock(fresh[g.startIdx], g.math);
         }
-
         return true;
     }
 
-    // --- RUN ---
-
+    // --- Run ---
     async function runScan() {
-        scanBtn.disabled = true;
-        logEl.innerHTML = '';
-        setStatus('Scanning...');
-
+        scanBtn.disabled = true; logEl.innerHTML = '';
+        setStatus('Scanning…', 'working');
         const { blocks, groups } = scanForMath();
-        log(`Found ${blocks.length} editable blocks on page`);
-
-        if (groups.length === 0) {
-            log('No math blocks detected.');
-            setStatus('No math found.');
+        log(`${blocks.length} editable blocks`);
+        if (!groups.length) {
+            setStatus('No math found', '');
             for (let i = 0; i < Math.min(blocks.length, 10); i++) {
                 const c = clean(blocks[i].textContent);
-                log(`  [${i}]: "${c.slice(0, 80)}${c.length > 80 ? '...' : ''}"`);
+                log(`[${i}] ${c.slice(0, 80)}${c.length > 80 ? '…' : ''}`);
             }
         } else {
-            for (const g of groups) {
-                log(`✓ ${g.type} [blocks ${g.startIdx}→${g.endIdx}]: ${g.math.slice(0, 80)}`);
-            }
-            setStatus(`Found ${groups.length} math block(s). Hit CONVERT.`);
+            for (const g of groups) log(`${g.type} [${g.startIdx}→${g.endIdx}]: ${g.math.slice(0, 80)}`, 'found');
+            setStatus(`${groups.length} math block(s) found`, 'success');
         }
-
         scanBtn.disabled = false;
     }
 
     async function runConvert() {
-        convertBtn.disabled = true;
-        scanBtn.disabled = true;
-        logEl.innerHTML = '';
-        setStatus('Converting...');
-
-        let converted = 0;
-        let safety = 0;
-
-        while (safety < 50) {
-            safety++;
-            const did = await convertOneGroup();
-            if (!did) break;
-            converted++;
-            setStatus(`Converted ${converted}, scanning for more...`);
-            await sleep(SETTLE_DELAY);
+        convertBtn.disabled = scanBtn.disabled = true;
+        logEl.innerHTML = ''; setStatus('Converting…', 'working');
+        let n = 0, s = 0;
+        while (s++ < 50) {
+            if (!(await convertOneGroup())) break;
+            n++; setStatus(`Converted ${n}…`, 'working'); await sleep(SETTLE_DELAY);
         }
-
-        setStatus(converted > 0 ? `Done! Converted ${converted} block(s).` : 'No math blocks found.');
-        log(`Finished. Total converted: ${converted}`);
-        convertBtn.disabled = false;
-        scanBtn.disabled = false;
+        setStatus(n ? `${n} block(s) converted` : 'No math blocks found', n ? 'success' : '');
+        log(`Done — ${n} converted`);
+        convertBtn.disabled = scanBtn.disabled = false;
     }
 
     scanBtn.onclick = runScan;
