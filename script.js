@@ -413,9 +413,12 @@
             }
 
             // Inline math: $...$ within a text block
+            // Only report the LAST match so we process right-to-left one at a time,
+            // re-scanning between each to keep offsets valid after DOM changes.
             const inlineMatches = findInlineMath(text);
             if (inlineMatches.length > 0) {
-                groups.push({ type: 'inline', startIdx: i, endIdx: i, math: inlineMatches.map(m => m.math).join(', '), blockCount: 1, inlineMatches });
+                const last = inlineMatches[inlineMatches.length - 1];
+                groups.push({ type: 'inline', startIdx: i, endIdx: i, math: last.math, blockCount: 1, inlineMatch: last, inlineTotal: inlineMatches.length });
                 used.add(i); continue;
             }
         }
@@ -462,73 +465,50 @@
         return { node: lastNode, offset: lastNode.textContent ? lastNode.textContent.length : 0 };
     }
 
-    async function convertInlineMath(block, inlineMatches) {
-        // Process matches from right to left so offsets stay valid
-        const sorted = [...inlineMatches].sort((a, b) => b.start - a.start);
+    async function convertOneInlineMath(block, match) {
+        block.focus(); await sleep(ACTION_DELAY);
 
-        for (const match of sorted) {
-            block.focus(); await sleep(ACTION_DELAY);
+        // Select the $...$ text in the DOM
+        const startPos = findTextPosition(block, match.start);
+        const endPos = findTextPosition(block, match.end);
 
-            // Select the $...$ text in the DOM
-            const startPos = findTextPosition(block, match.start);
-            const endPos = findTextPosition(block, match.end);
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.setStart(startPos.node, startPos.offset);
+        range.setEnd(endPos.node, endPos.offset);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        await sleep(ACTION_DELAY);
 
-            const sel = window.getSelection();
-            const range = document.createRange();
-            range.setStart(startPos.node, startPos.offset);
-            range.setEnd(endPos.node, endPos.offset);
-            sel.removeAllRanges();
-            sel.addRange(range);
-            await sleep(ACTION_DELAY);
+        // Delete the selected $...$ text — cursor stays in position
+        document.execCommand('delete');
+        await sleep(ACTION_DELAY);
 
-            // Delete the selected $...$ text
-            document.execCommand('delete');
-            await sleep(ACTION_DELAY);
+        // Use slash command to insert inline equation (same pattern as /math for blocks)
+        document.execCommand('insertText', false, '/inline equation');
+        await sleep(MENU_DELAY);
+        pressKey(document.activeElement, 'Enter', 13);
+        await sleep(500);
 
-            // Open inline equation with Ctrl+Shift+E
-            const eqEvent = {
-                key: 'e', keyCode: 69, code: 'KeyE',
-                ctrlKey: true, shiftKey: true, metaKey: false,
-                bubbles: true, cancelable: true
-            };
-            // Try both Ctrl and Cmd (for macOS)
-            const isMac = navigator.platform.toUpperCase().includes('MAC');
-            if (isMac) {
-                eqEvent.ctrlKey = false;
-                eqEvent.metaKey = true;
-            }
-            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', eqEvent));
-            document.activeElement.dispatchEvent(new KeyboardEvent('keypress', eqEvent));
-            document.activeElement.dispatchEvent(new KeyboardEvent('keyup', eqEvent));
-            await sleep(500);
+        // Type the math content into the inline equation editor
+        document.execCommand('insertText', false, match.math);
+        await sleep(ACTION_DELAY);
 
-            // Type the math content into the inline equation editor
-            document.execCommand('insertText', false, match.math);
-            await sleep(ACTION_DELAY);
-
-            // Close the inline equation editor
-            pressKey(document.activeElement, 'Escape', 27);
-            await sleep(ACTION_DELAY);
-
-            // Re-fetch the block reference since DOM may have changed
-            const fresh = getPageBlocks();
-            if (block._nmtIdx !== undefined && block._nmtIdx < fresh.length) {
-                block = fresh[block._nmtIdx];
-            }
-        }
+        // Close the inline equation editor
+        pressKey(document.activeElement, 'Escape', 27);
+        await sleep(ACTION_DELAY);
     }
 
     async function convertOneGroup() {
         const { blocks, groups } = scanForMath();
         if (!groups.length) return false;
         const g = groups[0];
-        log(`${g.type} · ${g.blockCount} block(s)`, 'found');
+        const extra = g.inlineTotal ? ` (${g.inlineTotal} in block)` : '';
+        log(`${g.type} · ${g.blockCount} block(s)${extra}`, 'found');
         log(`  ${g.math.slice(0, 70)}${g.math.length > 70 ? '…' : ''}`);
 
         if (g.type === 'inline') {
-            const block = blocks[g.startIdx];
-            block._nmtIdx = g.startIdx;
-            await convertInlineMath(block, g.inlineMatches);
+            await convertOneInlineMath(blocks[g.startIdx], g.inlineMatch);
         } else if (g.blockCount === 1) {
             await typeAsMathBlock(blocks[g.startIdx], g.math);
         } else {
