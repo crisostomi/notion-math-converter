@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Notion Math Converter v6.3
+// @name         Notion Math Converter v7.0
 // @namespace    http://tampermonkey.net/
-// @version      6.3
-// @description  Finds multi-line [ ... ] and $$ ... $$ math blocks in Notion and converts them to equation blocks.
+// @version      7.0
+// @description  Finds inline $...$ math, block $$...$$ math, and [...] math in Notion and converts them to equation blocks.
 // @author       You
 // @match        https://www.notion.so/*
 // @match        https://www.notion.site/*
@@ -354,6 +354,19 @@
     }
 
     // --- Scanning ---
+    // Regex: match $...$ but not $$...$$. Captures the content between single dollars.
+    const INLINE_MATH_RE = /(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)/g;
+
+    function findInlineMath(text) {
+        const matches = [];
+        let m;
+        INLINE_MATH_RE.lastIndex = 0;
+        while ((m = INLINE_MATH_RE.exec(text)) !== null) {
+            matches.push({ start: m.index, end: m.index + m[0].length, math: m[1].trim(), full: m[0] });
+        }
+        return matches;
+    }
+
     function scanForMath() {
         const blocks = getPageBlocks(), groups = [], used = new Set();
         for (let i = 0; i < blocks.length; i++) {
@@ -398,6 +411,13 @@
                 groups.push({ type: 'dollar-single', startIdx: i, endIdx: i, math: inner, blockCount: 1 });
                 used.add(i); continue;
             }
+
+            // Inline math: $...$ within a text block
+            const inlineMatches = findInlineMath(text);
+            if (inlineMatches.length > 0) {
+                groups.push({ type: 'inline', startIdx: i, endIdx: i, math: inlineMatches.map(m => m.math).join(', '), blockCount: 1, inlineMatches });
+                used.add(i); continue;
+            }
         }
         return { blocks, groups };
     }
@@ -420,6 +440,84 @@
         pressKey(document.activeElement, 'Escape', 27); await sleep(ACTION_DELAY);
     }
 
+    // Find the text node and offset within an element that corresponds to a
+    // character offset in the element's cleaned text content.
+    function findTextPosition(el, targetOffset) {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let offset = 0;
+        while (walker.nextNode()) {
+            const node = walker.currentNode;
+            const text = node.textContent;
+            // Count cleaned characters contributed by this text node
+            for (let i = 0; i < text.length; i++) {
+                const ch = text[i];
+                // Skip zero-width and non-breaking space chars (same as clean())
+                if (/[\u200B-\u200D\u2060\uFEFF\u00A0]/.test(ch)) continue;
+                if (offset === targetOffset) return { node, offset: i };
+                offset++;
+            }
+        }
+        // Return end of last text node
+        const lastNode = el.lastChild || el;
+        return { node: lastNode, offset: lastNode.textContent ? lastNode.textContent.length : 0 };
+    }
+
+    async function convertInlineMath(block, inlineMatches) {
+        // Process matches from right to left so offsets stay valid
+        const sorted = [...inlineMatches].sort((a, b) => b.start - a.start);
+
+        for (const match of sorted) {
+            block.focus(); await sleep(ACTION_DELAY);
+
+            // Select the $...$ text in the DOM
+            const startPos = findTextPosition(block, match.start);
+            const endPos = findTextPosition(block, match.end);
+
+            const sel = window.getSelection();
+            const range = document.createRange();
+            range.setStart(startPos.node, startPos.offset);
+            range.setEnd(endPos.node, endPos.offset);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            await sleep(ACTION_DELAY);
+
+            // Delete the selected $...$ text
+            document.execCommand('delete');
+            await sleep(ACTION_DELAY);
+
+            // Open inline equation with Ctrl+Shift+E
+            const eqEvent = {
+                key: 'e', keyCode: 69, code: 'KeyE',
+                ctrlKey: true, shiftKey: true, metaKey: false,
+                bubbles: true, cancelable: true
+            };
+            // Try both Ctrl and Cmd (for macOS)
+            const isMac = navigator.platform.toUpperCase().includes('MAC');
+            if (isMac) {
+                eqEvent.ctrlKey = false;
+                eqEvent.metaKey = true;
+            }
+            document.activeElement.dispatchEvent(new KeyboardEvent('keydown', eqEvent));
+            document.activeElement.dispatchEvent(new KeyboardEvent('keypress', eqEvent));
+            document.activeElement.dispatchEvent(new KeyboardEvent('keyup', eqEvent));
+            await sleep(500);
+
+            // Type the math content into the inline equation editor
+            document.execCommand('insertText', false, match.math);
+            await sleep(ACTION_DELAY);
+
+            // Close the inline equation editor
+            pressKey(document.activeElement, 'Escape', 27);
+            await sleep(ACTION_DELAY);
+
+            // Re-fetch the block reference since DOM may have changed
+            const fresh = getPageBlocks();
+            if (block._nmtIdx !== undefined && block._nmtIdx < fresh.length) {
+                block = fresh[block._nmtIdx];
+            }
+        }
+    }
+
     async function convertOneGroup() {
         const { blocks, groups } = scanForMath();
         if (!groups.length) return false;
@@ -427,7 +525,11 @@
         log(`${g.type} · ${g.blockCount} block(s)`, 'found');
         log(`  ${g.math.slice(0, 70)}${g.math.length > 70 ? '…' : ''}`);
 
-        if (g.blockCount === 1) {
+        if (g.type === 'inline') {
+            const block = blocks[g.startIdx];
+            block._nmtIdx = g.startIdx;
+            await convertInlineMath(block, g.inlineMatches);
+        } else if (g.blockCount === 1) {
             await typeAsMathBlock(blocks[g.startIdx], g.math);
         } else {
             for (let j = g.endIdx; j > g.startIdx; j--) {
