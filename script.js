@@ -2,7 +2,7 @@
 // @name         Notion Math Converter v7.0
 // @namespace    http://tampermonkey.net/
 // @version      7.0
-// @description  Finds inline $...$/(…) math, block $$...$$ math, and [...] math in Notion and converts them to equation blocks.
+// @description  Finds inline $...$, \(...\) math, block $$...$$, \[...\] math, and [...] math in Notion and converts them to equation blocks.
 // @author       You
 // @match        https://www.notion.so/*
 // @match        https://www.notion.site/*
@@ -363,9 +363,8 @@
     // --- Scanning ---
     // Regex: match $...$ but not $$...$$. Captures the content between single dollars.
     const INLINE_MATH_RE = /(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)/g;
-    // Regex: match (...) containing at least one math-like character
-    const INLINE_PAREN_RE = /\(([^()]+)\)/g;
-    const MATH_CHAR_RE = /[\\{}^_=+\-*/<>]/;
+    // Regex: match \(...\) LaTeX inline math delimiters
+    const INLINE_PAREN_RE = /\\\((.+?)\\\)/g;
 
     function findInlineMath(text) {
         const matches = [];
@@ -376,13 +375,9 @@
         }
         INLINE_PAREN_RE.lastIndex = 0;
         while ((m = INLINE_PAREN_RE.exec(text)) !== null) {
-            const inner = m[1].trim();
-            if (MATH_CHAR_RE.test(inner)) {
-                // Avoid overlapping with $...$ matches
-                const s = m.index, e = m.index + m[0].length;
-                if (!matches.some(x => (s >= x.start && s < x.end) || (e > x.start && e <= x.end))) {
-                    matches.push({ start: s, end: e, math: inner, full: m[0] });
-                }
+            const s = m.index, e = m.index + m[0].length;
+            if (!matches.some(x => (s >= x.start && s < x.end) || (e > x.start && e <= x.end))) {
+                matches.push({ start: s, end: e, math: m[1].trim(), full: m[0] });
             }
         }
         matches.sort((a, b) => a.start - b.start);
@@ -414,6 +409,24 @@
                     groups.push({ type: 'bracket-single', startIdx: i, endIdx: i, math: inner, blockCount: 1 });
                     used.add(i); continue;
                 }
+            }
+            if (text === '\\[') {
+                let lines = [], end = -1;
+                for (let j = i + 1; j < blocks.length && j < i + 40; j++) {
+                    const t = clean(blocks[j].textContent);
+                    if (t === '\\]') { end = j; break; }
+                    lines.push(t);
+                }
+                if (end !== -1 && lines.length) {
+                    groups.push({ type: 'backslash-bracket-multi', startIdx: i, endIdx: end, math: lines.join(' '), blockCount: end - i + 1 });
+                    for (let k = i; k <= end; k++) used.add(k);
+                    continue;
+                }
+            }
+            if (text.startsWith('\\[') && text.endsWith('\\]') && text.length > 4) {
+                const inner = text.slice(2, -2).trim();
+                groups.push({ type: 'backslash-bracket-single', startIdx: i, endIdx: i, math: inner, blockCount: 1 });
+                used.add(i); continue;
             }
             if (text === '$$') {
                 let lines = [], end = -1;
@@ -491,13 +504,12 @@
         return data.recordMap?.block?.[blockId]?.value;
     }
 
-    // Replace $...$ patterns in Notion's rich text title array.
+    // Replace $...$ and \(...\) patterns in Notion's rich text title array.
     // Each segment is ["text"] or ["text", [["format", "value"], ...]].
     // Inline equations are ["⁍", [["e", "latex"]]].
     function replaceInlineMathInTitle(title) {
         const DOLLAR_RE = /(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)/g;
-        const PAREN_RE = /\(([^()]+)\)/g;
-        const MATH_RE = /[\\{}^_=+\-*/<>]/;
+        const PAREN_RE = /\\\((.+?)\\\)/g;
         const newTitle = [];
         let changed = false;
 
@@ -511,7 +523,7 @@
                 continue;
             }
 
-            // Collect all inline math matches (dollar and paren)
+            // Collect all inline math matches ($...$ and \(...\))
             const allMatches = [];
             let match;
             DOLLAR_RE.lastIndex = 0;
@@ -520,12 +532,9 @@
             }
             PAREN_RE.lastIndex = 0;
             while ((match = PAREN_RE.exec(text)) !== null) {
-                const inner = match[1].trim();
-                if (MATH_RE.test(inner)) {
-                    const s = match.index, e = match.index + match[0].length;
-                    if (!allMatches.some(x => (s >= x.start && s < x.end) || (e > x.start && e <= x.end))) {
-                        allMatches.push({ start: s, end: e, math: inner });
-                    }
+                const s = match.index, e = match.index + match[0].length;
+                if (!allMatches.some(x => (s >= x.start && s < x.end) || (e > x.start && e <= x.end))) {
+                    allMatches.push({ start: s, end: e, math: match[1].trim() });
                 }
             }
             allMatches.sort((a, b) => a.start - b.start);
@@ -539,7 +548,7 @@
                     const before = text.slice(lastIndex, m.start);
                     parts.push(formats ? [before, formats.map(f => [...f])] : [before]);
                 }
-                parts.push(['\u2041', [['e', m.math]]]);
+                parts.push(['\u204D', [['e', m.math]]]);
                 lastIndex = m.end;
             }
 
