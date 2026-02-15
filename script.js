@@ -2,7 +2,7 @@
 // @name         Notion Math Converter v7.0
 // @namespace    http://tampermonkey.net/
 // @version      7.0
-// @description  Finds inline $...$ math, block $$...$$ math, and [...] math in Notion and converts them to equation blocks.
+// @description  Finds inline $...$/(…) math, block $$...$$ math, and [...] math in Notion and converts them to equation blocks.
 // @author       You
 // @match        https://www.notion.so/*
 // @match        https://www.notion.site/*
@@ -326,6 +326,13 @@
     const sleep = ms => new Promise(r => setTimeout(r, ms));
     function clean(t) { return t.replace(/[\u200B-\u200D\u2060\uFEFF\u00A0]/g, '').trim(); }
 
+    // Get text content of a block, excluding any already-converted inline equation elements
+    function getScannableText(el) {
+        const clone = el.cloneNode(true);
+        clone.querySelectorAll('[class*="katex"], [class*="notion-equation"], [data-token-index]').forEach(eq => eq.remove());
+        return clean(clone.textContent);
+    }
+
     function selectContentsOf(el) {
         const s = window.getSelection(), r = document.createRange();
         r.selectNodeContents(el); s.removeAllRanges(); s.addRange(r);
@@ -356,6 +363,9 @@
     // --- Scanning ---
     // Regex: match $...$ but not $$...$$. Captures the content between single dollars.
     const INLINE_MATH_RE = /(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)/g;
+    // Regex: match (...) containing at least one math-like character
+    const INLINE_PAREN_RE = /\(([^()]+)\)/g;
+    const MATH_CHAR_RE = /[\\{}^_=+\-*/<>]/;
 
     function findInlineMath(text) {
         const matches = [];
@@ -364,6 +374,18 @@
         while ((m = INLINE_MATH_RE.exec(text)) !== null) {
             matches.push({ start: m.index, end: m.index + m[0].length, math: m[1].trim(), full: m[0] });
         }
+        INLINE_PAREN_RE.lastIndex = 0;
+        while ((m = INLINE_PAREN_RE.exec(text)) !== null) {
+            const inner = m[1].trim();
+            if (MATH_CHAR_RE.test(inner)) {
+                // Avoid overlapping with $...$ matches
+                const s = m.index, e = m.index + m[0].length;
+                if (!matches.some(x => (s >= x.start && s < x.end) || (e > x.start && e <= x.end))) {
+                    matches.push({ start: s, end: e, math: inner, full: m[0] });
+                }
+            }
+        }
+        matches.sort((a, b) => a.start - b.start);
         return matches;
     }
 
@@ -371,7 +393,7 @@
         const blocks = getPageBlocks(), groups = [], used = new Set();
         for (let i = 0; i < blocks.length; i++) {
             if (used.has(i)) continue;
-            const text = clean(blocks[i].textContent);
+            const text = getScannableText(blocks[i]);
 
             if (text === '[') {
                 let lines = [], end = -1;
@@ -412,13 +434,10 @@
                 used.add(i); continue;
             }
 
-            // Inline math: $...$ within a text block
-            // Only report the LAST match so we process right-to-left one at a time,
-            // re-scanning between each to keep offsets valid after DOM changes.
+            // Inline math: $...$ within a text block (converted via Notion API, all at once)
             const inlineMatches = findInlineMath(text);
             if (inlineMatches.length > 0) {
-                const last = inlineMatches[inlineMatches.length - 1];
-                groups.push({ type: 'inline', startIdx: i, endIdx: i, math: last.math, blockCount: 1, inlineMatch: last, inlineTotal: inlineMatches.length });
+                groups.push({ type: 'inline', startIdx: i, endIdx: i, math: inlineMatches.map(m => m.math).join(', '), blockCount: 1, inlineCount: inlineMatches.length });
                 used.add(i); continue;
             }
         }
@@ -443,72 +462,143 @@
         pressKey(document.activeElement, 'Escape', 27); await sleep(ACTION_DELAY);
     }
 
-    // Find the text node and offset within an element that corresponds to a
-    // character offset in the element's cleaned text content.
-    function findTextPosition(el, targetOffset) {
-        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-        let offset = 0;
-        while (walker.nextNode()) {
-            const node = walker.currentNode;
-            const text = node.textContent;
-            // Count cleaned characters contributed by this text node
-            for (let i = 0; i < text.length; i++) {
-                const ch = text[i];
-                // Skip zero-width and non-breaking space chars (same as clean())
-                if (/[\u200B-\u200D\u2060\uFEFF\u00A0]/.test(ch)) continue;
-                if (offset === targetOffset) return { node, offset: i };
-                offset++;
-            }
-        }
-        // Return end of last text node
-        const lastNode = el.lastChild || el;
-        return { node: lastNode, offset: lastNode.textContent ? lastNode.textContent.length : 0 };
+    // --- Notion API for inline equations ---
+    // Slash commands can only create block-level equations, not inline.
+    // So we use Notion's internal API to directly modify the block's rich text.
+
+    function generateUUID() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
     }
 
-    async function convertOneInlineMath(block, match) {
-        block.focus(); await sleep(ACTION_DELAY);
+    async function notionApi(endpoint, body) {
+        const res = await fetch(`/api/v3/${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            credentials: 'include'
+        });
+        if (!res.ok) throw new Error(`API ${endpoint}: ${res.status}`);
+        return res.json();
+    }
 
-        // Select the $...$ text in the DOM
-        const startPos = findTextPosition(block, match.start);
-        const endPos = findTextPosition(block, match.end);
+    async function getBlockRecord(blockId) {
+        const data = await notionApi('syncRecordValues', {
+            requests: [{ pointer: { table: 'block', id: blockId }, version: -1 }]
+        });
+        return data.recordMap?.block?.[blockId]?.value;
+    }
 
-        const sel = window.getSelection();
-        const range = document.createRange();
-        range.setStart(startPos.node, startPos.offset);
-        range.setEnd(endPos.node, endPos.offset);
-        sel.removeAllRanges();
-        sel.addRange(range);
-        await sleep(ACTION_DELAY);
+    // Replace $...$ patterns in Notion's rich text title array.
+    // Each segment is ["text"] or ["text", [["format", "value"], ...]].
+    // Inline equations are ["⁍", [["e", "latex"]]].
+    function replaceInlineMathInTitle(title) {
+        const DOLLAR_RE = /(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)/g;
+        const PAREN_RE = /\(([^()]+)\)/g;
+        const MATH_RE = /[\\{}^_=+\-*/<>]/;
+        const newTitle = [];
+        let changed = false;
 
-        // Delete the selected $...$ text — cursor stays in position
-        document.execCommand('delete');
-        await sleep(ACTION_DELAY);
+        for (const segment of title) {
+            const text = segment[0];
+            const formats = segment.length > 1 ? segment[1] : null;
 
-        // Use slash command to insert inline equation (same pattern as /math for blocks)
-        document.execCommand('insertText', false, '/inline equation');
-        await sleep(MENU_DELAY);
-        pressKey(document.activeElement, 'Enter', 13);
-        await sleep(500);
+            // Don't touch segments that are already equations
+            if (formats && formats.some(f => f[0] === 'e')) {
+                newTitle.push(segment);
+                continue;
+            }
 
-        // Type the math content into the inline equation editor
-        document.execCommand('insertText', false, match.math);
-        await sleep(ACTION_DELAY);
+            // Collect all inline math matches (dollar and paren)
+            const allMatches = [];
+            let match;
+            DOLLAR_RE.lastIndex = 0;
+            while ((match = DOLLAR_RE.exec(text)) !== null) {
+                allMatches.push({ start: match.index, end: match.index + match[0].length, math: match[1].trim() });
+            }
+            PAREN_RE.lastIndex = 0;
+            while ((match = PAREN_RE.exec(text)) !== null) {
+                const inner = match[1].trim();
+                if (MATH_RE.test(inner)) {
+                    const s = match.index, e = match.index + match[0].length;
+                    if (!allMatches.some(x => (s >= x.start && s < x.end) || (e > x.start && e <= x.end))) {
+                        allMatches.push({ start: s, end: e, math: inner });
+                    }
+                }
+            }
+            allMatches.sort((a, b) => a.start - b.start);
 
-        // Close the inline equation editor
-        pressKey(document.activeElement, 'Escape', 27);
-        await sleep(ACTION_DELAY);
+            let lastIndex = 0;
+            const parts = [];
+
+            for (const m of allMatches) {
+                changed = true;
+                if (m.start > lastIndex) {
+                    const before = text.slice(lastIndex, m.start);
+                    parts.push(formats ? [before, formats.map(f => [...f])] : [before]);
+                }
+                parts.push(['\u2041', [['e', m.math]]]);
+                lastIndex = m.end;
+            }
+
+            if (lastIndex < text.length) {
+                const after = text.slice(lastIndex);
+                parts.push(formats ? [after, formats.map(f => [...f])] : [after]);
+            }
+
+            if (parts.length > 0) {
+                newTitle.push(...parts);
+            } else {
+                newTitle.push(segment);
+            }
+        }
+
+        return { newTitle, changed };
+    }
+
+    async function convertInlineMathViaApi(blockEl) {
+        const container = blockEl.closest('[data-block-id]');
+        if (!container) throw new Error('No data-block-id on block element');
+        const blockId = container.getAttribute('data-block-id');
+
+        const record = await getBlockRecord(blockId);
+        if (!record) throw new Error('Block record not found');
+
+        const title = record.properties?.title;
+        if (!title) throw new Error('No title property on block');
+
+        const { newTitle, changed } = replaceInlineMathInTitle(title);
+        if (!changed) return false;
+
+        await notionApi('saveTransactions', {
+            requestId: generateUUID(),
+            transactions: [{
+                id: generateUUID(),
+                operations: [{
+                    pointer: { table: 'block', id: blockId, spaceId: record.space_id },
+                    path: ['properties', 'title'],
+                    command: 'set',
+                    args: newTitle
+                }]
+            }]
+        });
+
+        return true;
     }
 
     async function convertOneGroup() {
         const { blocks, groups } = scanForMath();
         if (!groups.length) return false;
         const g = groups[0];
-        const extra = g.inlineTotal ? ` (${g.inlineTotal} in block)` : '';
+        const extra = g.inlineCount ? ` (${g.inlineCount} equations)` : '';
         log(`${g.type} · ${g.blockCount} block(s)${extra}`, 'found');
         log(`  ${g.math.slice(0, 70)}${g.math.length > 70 ? '…' : ''}`);
 
         if (g.type === 'inline') {
-            await convertOneInlineMath(blocks[g.startIdx], g.inlineMatch);
+            await convertInlineMathViaApi(blocks[g.startIdx]);
+            await sleep(SETTLE_DELAY); // wait for Notion to re-render
         } else if (g.blockCount === 1) {
             await typeAsMathBlock(blocks[g.startIdx], g.math);
         } else {
